@@ -1,13 +1,10 @@
 use reqwest::Client;
 use serde::Deserialize;
-use tokio::sync::Semaphore;
-use futures::future;
 use std::{
     fs::File,
     io::{self, Write},
-    path::Path, sync::Arc,
+    path::Path,
 };
-
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,17 +27,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     std::fs::create_dir_all("mods")?;
 
-    // Semaphore to limit the number of concurrent downloads
-    let semaphore = Arc::new(Semaphore::new(10)); // Limit to 10 concurrent downloads (adjust as needed)
-    
-    let mut download_tasks = vec![];
-
     for project_id in collection.projects {
         let project_url = format!("https://api.modrinth.com/v3/project/{}", project_id);
 
         // Fetch project details
         let project_response = client.get(&project_url).send().await?;
         let project: ModrinthProject = project_response.json().await?;
+
+        let mut downloaded = false;
 
         for version_id in project.versions {
             let version_url = format!("https://api.modrinth.com/v3/version/{}", version_id);
@@ -53,63 +47,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if version.game_versions.contains(&mc_version.to_string())
                 && version.loaders.contains(&loader)
             {
-                let file_url = version.files[0].url.clone();
-                let file_name = format!("mods/{}", version.files[0].filename);
+                // Download the file only once for the first matching version
+                if !downloaded {
+                    let file_url = &version.files[0].url;
+                    let file_name = format!("mods/{}", version.files[0].filename);
 
-                if !Path::new(&file_name).exists() {
-                    let client = client.clone();
-                    let file_url = file_url.clone();
-                    let semaphore = Arc::clone(&semaphore);
-                    let semaphore = semaphore.clone();
+                    if !Path::new(&file_name).exists() {
+                        println!("Downloading {}...", version.files[0].filename);
+                        let mut file = File::create(&file_name)?;
+                        let mut response = client.get(file_url).send().await?;
 
-                    // Spawn a task for downloading the mod concurrently
-                    let task = tokio::spawn(async move {
-                        let permit = semaphore.acquire().await.unwrap(); // Acquire a permit before starting the download
-                        match download_file(&client, &file_url, &file_name).await {
-                            Ok(()) => println!("Downloaded {} successfully.", file_name),
-                            Err(e) => eprintln!("Failed to download {}: {}", file_name, e),
+                        // Stream the content to the file
+                        while let Some(chunk) = response.chunk().await? {
+                            file.write_all(&chunk)?;
                         }
-                        drop(permit); // Release the permit after the task completes
-                    });
+                        println!("Downloaded {} successfully.", version.files[0].filename);
+                    } else {
+                        println!("File {} already exists, skipping download.", version.files[0].filename);
+                    }
 
-                    download_tasks.push(task);
-                } else {
-                    println!("File {} already exists, skipping download.", file_name);
+                    downloaded = true;  // Mark the project as downloaded to prevent further downloads
+                    break;  // Break the inner loop once a valid version is found and downloaded
                 }
             }
         }
     }
 
-    // Wait for all download tasks to finish
-    future::join_all(download_tasks).await; 
-
     println!("All compatible mods downloaded!");
     Ok(())
 }
 
-// Function to handle the file download
-async fn download_file(client: &Client, file_url: &str, file_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut file = File::create(file_name)?;
-    let mut response = client.get(file_url).send().await?;
 
-    // Stream the content to the file
-    while let Some(chunk) = response.chunk().await? {
-        file.write_all(&chunk)?;
-    }
-
-    Ok(())
-}
-
-// Data structures for deserializing API responses
 #[derive(Deserialize)]
 struct ModrinthCollection {
-    projects: Vec<String>, // Projects are represented as project IDs (strings)
+    projects: Vec<String>,
 }
 
 #[derive(Deserialize)]
 struct ModrinthProject {
     slug: String,
-    versions: Vec<String>, // Versions are represented as version IDs (strings)
+    versions: Vec<String>,
 }
 
 #[derive(Deserialize)]
